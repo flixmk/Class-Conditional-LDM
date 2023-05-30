@@ -40,9 +40,9 @@ class H5PyTorchDataset(Dataset):
 class LatentDataModule(LightningDataModule):
     def __init__(
         self,
-        train_dataset_path: str = "./trained_vae_train.h5",
-        val_dataset_path: str = "./trained_vae_test.h5",
-        train_batch_size: int = 64,
+        train_dataset_path: str = "./array_file_train.h5",
+        val_dataset_path: str = "./sd_vae_val_latents.h5",
+        train_batch_size: int = 32,
         val_batch_size: int = 8,
         num_workers: int = 32,
     ):
@@ -53,20 +53,24 @@ class LatentDataModule(LightningDataModule):
         self.val_batch_size = val_batch_size
         self.num_workers = num_workers
 
-        
-        if os.path.isfile("./sd_vae_train_latents.h5"):
-            print("sd_vae_train_latents.h5 already exist")
-        else:
-            call('wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/sd_vae_train_latents.h5', shell=True)
-        if os.path.isfile("./sd_vae_val_latents.h5"):
-            print("sd_vae_val_latents.h5 already exist")
-        else:
-            call('wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/sd_vae_val_latents.h5', shell=True)
+#         try:
+#             if os.path.isfile(self.train_dataset_path):
+#                 print("Train dataset already exist")
+#             else:
+#                 download_file_name = self.train_dataset_path.split("/")[-1]
+#                 call(f'wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/{download_file_name}', shell=True)
+#             if os.path.isfile(self.val_dataset_path):
+#                 print("Val dataset already exist")
+#             else:
+#                 download_file_name = self.val_dataset_path.split("/")[-1]
+#                 call(f'wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/{download_file_name}', shell=True)
+#         except:
+#             pass
             
-        if not os.path.isfile("./finetuned_best.pt"):
-            call('wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/finetuned_best.pt', shell=True)
-        if not os.path.isfile("./low_vloss_e6.pt"):
-            call('wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/low_vloss_e6.pt', shell=True)
+#         if not os.path.isfile("./finetuned_best.pt"):
+#             call('wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/finetuned_best.pt', shell=True)
+#         if not os.path.isfile("./low_vloss_e6.pt"):
+#             call('wget -q https://huggingface.co/flix-k/sd_dependencies/resolve/main/low_vloss_e6.pt', shell=True)
 
         self.train_dataset = H5PyTorchDataset(self.train_dataset_path)
         self.val_dataset = H5PyTorchDataset(self.val_dataset_path)

@@ -19,7 +19,9 @@ from cleanfid import fid
 import timm
 import shutil
 import wandb
+from svdiff_pytorch import load_unet_for_svdiff
 import torch.nn as nn
+import itertools
 
 def compute_snr(timesteps, noise_scheduler):
     alphas_cumprod = noise_scheduler.alphas_cumprod
@@ -48,12 +50,12 @@ def encode_strings(strings: List[str], tokenizer, text_encoder):
         # Tokenize the string and create input tensor
         inputs = tokenizer(
             string, max_length=4, padding="max_length", truncation=True, return_tensors="pt"
-        )
+        ).input_ids
         
 
         # Encode the string using the CLIPTextModel
         with torch.no_grad():
-            encoded = text_encoder(**inputs)[0]
+            encoded = text_encoder(inputs)[0]
 
         # Save the encoded string in the dictionary
         # check here!
@@ -83,9 +85,13 @@ class LatentDiffusionModel(LightningModule):
         self.snr_gamma = 5.0
         self.average_meter_train = AverageMeter()
         self.average_meter_val = AverageMeter()
+        self.use_svdiff = False
+        self.train_text_encoder = True
+        self.lr_unet = 5e-5
+        self.lr_text_encoder = 5e-6
 
         # needed constantly
-        self.unet = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="unet")
+        self.unet = self.get_unet()
         self.noise_scheduler = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="scheduler")
         self.noise_scheduler.prediction_type = "v_prediction"
         
@@ -98,19 +104,6 @@ class LatentDiffusionModel(LightningModule):
         #                                     prediction_type= "v_prediction",
         #                                     trained_betas= None
         #                                     )
-        
-        self.unet.enable_xformers_memory_efficient_attention()
-        self.unet.enable_gradient_checkpointing()
-
-        self.unet.half()  # convert to half precision
-
-        for layer in self.unet.modules():
-            if isinstance(layer, nn.BatchNorm2d):
-                layer.float()
-            if isinstance(layer, nn.GroupNorm):
-                layer.float()
-            if isinstance(layer, nn.LayerNorm):
-                layer.float()
 
         text_encoder = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="text_encoder")
         text_encoder.gradient_checkpointing_enable()
@@ -118,11 +111,38 @@ class LatentDiffusionModel(LightningModule):
         self.encoded_prompts = encode_strings(self.class_prompts, tokenizer, text_encoder)
 
         # delete the text encoder and tokenizer to save memory
-        text_encoder.to("cpu")
-        torch.cuda.empty_cache()
-        del text_encoder
-        del tokenizer
-        torch.cuda.empty_cache()
+        if self.train_text_encoder:
+            self.text_encoder = text_encoder
+            self.tokenizer = tokenizer
+        else:
+            text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+            del text_encoder
+            del tokenizer
+            torch.cuda.empty_cache()
+
+    def get_unet(self):
+
+        if self.use_svdiff:
+            unet = load_unet_for_svdiff("stabilityai/stable-diffusion-2-1-base", subfolder="unet")
+            unet.enable_xformers_memory_efficient_attention()
+            unet.enable_gradient_checkpointing()
+            return unet
+        else:
+            unet = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="unet")
+            unet.enable_xformers_memory_efficient_attention()
+            unet.enable_gradient_checkpointing()
+
+            unet.half()  # convert to half precision
+
+            for layer in unet.modules():
+                if isinstance(layer, nn.BatchNorm2d):
+                    layer.float()
+                if isinstance(layer, nn.GroupNorm):
+                    layer.float()
+                if isinstance(layer, nn.LayerNorm):
+                    layer.float()
+            return unet
 
     def forward(self, x):
         # Implement the forward function if necessary.
@@ -146,7 +166,14 @@ class LatentDiffusionModel(LightningModule):
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
         timesteps = timesteps.long()
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-        encoder_hidden_states = self.get_tensors_from_dict(batch["labels"], self.encoded_prompts).to(self.device)
+        if self.train_text_encoder:
+            inputs_strings = [self.class_prompts[i] for i in batch["labels"]]
+            inputs = self.tokenizer(
+                inputs_strings, max_length=4, padding="max_length", truncation=True, return_tensors="pt"
+            ).input_ids.to("cuda")
+            encoder_hidden_states = self.text_encoder(inputs)[0]
+        else:
+            encoder_hidden_states = self.get_tensors_from_dict(batch["labels"], self.encoded_prompts).to(self.device)
 
         if self.noise_scheduler.config.prediction_type == "epsilon":
             target = noise
@@ -188,15 +215,66 @@ class LatentDiffusionModel(LightningModule):
                 "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
             )
         optimizer_cls = bnb.optim.AdamW8bit
-        optimizer = optimizer_cls(
-            self.unet.parameters(),
-            lr=5e-5,
-            betas=(0.9, 0.999),
-            weight_decay=1e-2,
-            eps=1e-8,
-        )
-        return optimizer
-    
+        
+        if self.train_text_encoder:
+            # params_to_optimize = (
+            #     itertools.chain(self.unet.parameters(), self.text_encoder.parameters()) if self.train_text_encoder else self.unet.parameters()
+            # )
+            optimizer = optimizer_cls(
+                [
+                    {"params": self.unet.parameters(), "lr": self.lr_unet},
+                    {"params": self.text_encoder.parameters(), "lr": self.lr_text_encoder}
+                ],
+                lr=5e-5,  # This will be overridden for each group
+                betas=(0.9, 0.999),
+                weight_decay=1e-2,
+                eps=1e-8,
+            )
+            return optimizer
+        else:
+            optimizer = optimizer_cls(
+                self.unet.parameters(),
+                lr=self.lr_unet,
+                betas=(0.9, 0.999),
+                weight_decay=1e-2,
+                eps=1e-8,
+            )
+            return optimizer
+        
+    def on_before_zero_grad(self, optimizer):
+        if self.trainer.current_epoch > 1:
+            for param in self.text_encoder.parameters():
+                param.requires_grad = False
+        
+#     def optimizer_step(
+#         self,
+#         epoch,
+#         batch_idx,
+#         optimizer,
+#         optimizer_idx,
+#         optimizer_closure,
+#         on_tpu=False,
+#         using_native_amp=False,
+#         using_lbfgs=False,
+#     ):
+#         # update the learning rates
+#         if self.epoch_count > 1:
+#             for group in optimizer.param_groups:
+#                 if group['params'] == self.text_encoder.parameters():
+#                     group['lr'] = 0.0  # stop the learning for text_encoder after first epoch
+
+#         # Call the default optimizer step provided by PyTorch Lightning
+#         super().optimizer_step(
+#             epoch,
+#             batch_idx,
+#             optimizer,
+#             optimizer_idx,
+#             optimizer_closure,
+#             on_tpu,
+#             using_native_amp,
+#             using_lbfgs,
+#         )
+
     def on_training_epoch_start(self) -> None:
         pass
 
@@ -207,7 +285,7 @@ class LatentDiffusionModel(LightningModule):
         pass
 
     def on_validation_epoch_end(self):
-        self.generate_images(25)
+        self.generate_images(10)
         self.unet.to("cpu")
         torch.cuda.empty_cache()
         if self.global_rank==0:
@@ -296,7 +374,7 @@ class LatentDiffusionModel(LightningModule):
         pipeline = StableDiffusionPipeline.from_pretrained(
             "stabilityai/stable-diffusion-2-1-base",
             unet=self.unet,
-            vae=AutoencoderKL.from_pretrained("flix-k/custom_model_parts", subfolder="vae_trained"),
+            # vae=AutoencoderKL.from_pretrained("flix-k/custom_model_parts", subfolder="vae_trained_kl"),
             torch_dtype=torch.float16,
             safety_checker=None,
             )
