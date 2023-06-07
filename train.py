@@ -1,8 +1,8 @@
 
 from lightning.pytorch import callbacks, cli_lightning_logo
 from lightning.pytorch.cli import LightningCLI
-from modules.latent_data_module import LatentDataModule
-from modules.latent_diffusion_module import LatentDiffusionModel
+from modules.pickled_dataset import PickleDataModule
+from modules.diffusion import LatentDiffusionModel
 from pytorch_lightning.loggers import WandbLogger
 import torch
 
@@ -13,13 +13,14 @@ import torch
 def cli_main():
     cli = LightningCLI(
         LatentDiffusionModel,
-        LatentDataModule,
+        PickleDataModule,
         seed_everything_default=1234,
         run=False,  # used to de-activate automatic fitting.
         trainer_defaults={"max_epochs": 1000, 
                           "accelerator": 'gpu',
                           "precision": 'bf16',
-                          "check_val_every_n_epoch": 5},
+                          "check_val_every_n_epoch": 10,
+                         "gradient_clip_val":1,},
         save_config_kwargs={"overwrite": True},
     )
     cli.trainer.fit(cli.model, datamodule=cli.datamodule)
